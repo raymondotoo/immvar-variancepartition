@@ -1,0 +1,17 @@
+.DS_Store
+.Rhistory
+.RData
+.Rproj.user/
+library/
+data/raw/*
+!data/raw/README.md
+data/processed/*
+!data/processed/.gitkeep
+results/models/*
+!results/models/.gitkeep
+results/figures/*
+!results/figures/submission_summary.png
+!results/figures/submission_summary.pdf
+logs/
+~$*
+*.part
