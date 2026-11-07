@@ -1,0 +1,491 @@
+---
+title: "Step 1 · Prepare the ImmVar data"
+subtitle: "ImmVar variancePartition analysis"
+author: "Raymond Otoo"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    df_print: kable
+    theme: flatly
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, fig.align = "center")
+```
+
+> **In this step** we download the public ImmVar expression data from GEO, build a
+> table that describes every array, decide which donors to analyse, and save a
+> clean, log2-scale expression matrix for the modelling step.
+>
+> **Reads:** `data/source_files.csv` (download links and checksums)<br>
+> **Writes:** `data/processed/immvar.rds` and six tables in `results/tables/`<br>
+> **Run time:** under a minute, plus a one-time ~90 MB download
+
+# Background
+
+The ImmVar project measured gene expression in two immune cell types, naïve CD4
+T cells and monocytes, from several hundred healthy donors. The data are
+public in GEO as series [GSE56035](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE56035),
+measured on Affymetrix Human Gene 1.0 ST arrays (GEO platform
+[GPL6244](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GPL6244)).
+
+The question for the whole analysis is:
+
+> For each probe, how much of the variation in expression is associated with
+> **cell type**, **donor**, **age**, **sex** and **processing batch**?
+
+This first notebook only prepares the data. Steps 2–4 fit the models and
+interpret the results.
+
+# Setup
+
+The project keeps its packages in a local `library/` folder (created by
+`install_packages.R`) so it never changes your system-wide R installation.
+
+```{r packages}
+.libPaths(c("library", .libPaths()))
+library(data.table)  # fast reading and writing of large tables
+library(ggplot2)     # plots
+
+options(timeout = 600)  # allow up to 10 minutes for each GEO download
+
+# Create every output folder used by the four notebooks.
+for (folder in c("data/raw", "data/processed", "results/tables",
+                 "results/models", "results/figures")) {
+  dir.create(folder, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+# Download the GEO files
+
+We need two files:
+
+| File | Contents |
+|---|---|
+| `GSE56035_series_matrix.txt.gz` | Expression values **and** the sample information (age, sex, cell type, batch) |
+| `GPL6244.annot.gz` | Platform annotation, which maps each probe ID to a gene symbol |
+
+Their web addresses and MD5 checksums are stored in `data/source_files.csv`. A
+checksum is a fingerprint of the file: if GEO ever changes a file, or a download
+is cut short, the fingerprint will not match and the notebook stops rather than
+silently analysing different data.
+
+```{r download}
+sources <- read.csv("data/source_files.csv")
+
+for (i in seq_len(nrow(sources))) {
+  path <- file.path("data/raw", sources$file[i])
+
+  # Download only if we do not already have the file.
+  if (!file.exists(path)) {
+    download.file(sources$url[i], path, mode = "wb", method = "libcurl")
+  }
+
+  # Stop if the file is not exactly the version this analysis was built on.
+  if (unname(tools::md5sum(path)) != sources$md5[i]) {
+    stop("The GEO file differs from the version used here: ", path,
+         ". Check it before updating data/source_files.csv.")
+  }
+}
+
+sources[, c("file", "md5")]
+```
+
+# Read the sample information
+
+## How a GEO series matrix is laid out
+
+A series matrix is a plain-text file with two parts:
+
+1. **A header.** Each line starts with `!`. Lines that begin with `!Sample_`
+   hold one tab-separated value per array, such as its ID, title or donor age.
+2. **The expression table.** This sits between the lines
+   `!series_matrix_table_begin` and `!series_matrix_table_end`. Its rows are
+   probes and its columns are arrays.
+
+We first read just the header, stopping at the start of the table.
+
+```{r read-header}
+connection <- gzfile("data/raw/GSE56035_series_matrix.txt.gz", "rt")
+header <- character()
+repeat {
+  line <- readLines(connection, n = 1)
+  if (!length(line)) stop("Could not find the expression table.")
+  if (line == "!series_matrix_table_begin") break
+  header <- c(header, line)
+}
+close(connection)
+
+length(header)  # number of header lines
+```
+
+The sample characteristics are stored as `label: value` text. Here are the
+first few characters of each characteristics line, so you can see the format:
+
+```{r peek-characteristics}
+characteristic_lines <- header[startsWith(header, "!Sample_characteristics_ch1\t")]
+substr(characteristic_lines, 1, 80)
+```
+
+## Two small helper functions
+
+* `read_field()` returns the values of one named header line, such as
+  `!Sample_geo_accession`, with one value per array.
+* `read_characteristic()` finds the characteristics line whose label matches a
+  pattern, such as `"^batch:"`, and strips the label to keep only the value.
+
+Both helpers stop with an error if they do not find **exactly one** matching
+line. This guards against silently picking up the wrong field.
+
+```{r helpers}
+read_field <- function(name) {
+  line <- header[startsWith(header, paste0(name, "\t"))]
+  stopifnot(length(line) == 1)
+  scan(text = line, what = "", sep = "\t", quote = '"', quiet = TRUE)[-1]
+}
+
+# Split every characteristics line into one value per array.
+characteristics <- lapply(characteristic_lines, function(line) {
+  scan(text = line, what = "", sep = "\t", quote = '"', quiet = TRUE)[-1]
+})
+
+read_characteristic <- function(pattern) {
+  found <- vapply(characteristics,
+                  function(x) any(grepl(pattern, x, ignore.case = TRUE)),
+                  logical(1))
+  stopifnot(sum(found) == 1)
+  sub("^[^:]+: *", "", characteristics[[which(found)]])  # drop "label: "
+}
+```
+
+## Build the sample table
+
+We now build `metadata`, with **one row per array**. The donor ID
+(`Individual`) is the part of the sample title before the first dot. The same
+donor therefore has the same ID on their T-cell and monocyte arrays, which is
+what links a person's two cell types together.
+
+```{r build-metadata}
+metadata <- data.frame(
+  sample_id = read_field("!Sample_geo_accession"),
+  title     = read_field("!Sample_title"),
+  Age       = as.numeric(read_characteristic("^age ")),
+  Sex       = tools::toTitleCase(tolower(read_characteristic("^(sex|gender):"))),
+  CellType  = ifelse(grepl("monocyte", read_characteristic("^cell type:"),
+                           ignore.case = TRUE),
+                     "Monocyte", "CD4_T"),
+  Batch     = read_characteristic("^batch:")
+)
+metadata$Individual <- sub("\\..*$", "", metadata$title)
+
+# Sanity checks: nothing missing, IDs unique, donor IDs look like "IGTB123".
+stopifnot(!anyNA(metadata),
+          !anyDuplicated(metadata$sample_id),
+          all(grepl("^IGTB[0-9]+$", metadata$Individual)))
+
+head(metadata)
+```
+
+# Choose which donors to analyse
+
+The models in Step 2 separate **cell type** from **donor**. To do that cleanly,
+each donor must contribute arrays from **both** cell types. We also require
+each donor to have a single recorded age and a single recorded sex across their
+arrays. If the records disagree, we cannot know which value is correct, so we
+leave the donor out rather than guess.
+
+We first summarise each donor:
+
+```{r donor-summary}
+donors <- as.data.table(metadata)[, .(
+  n_arrays      = .N,                   # arrays from this donor
+  n_cell_types  = uniqueN(CellType),    # 1 or 2
+  n_ages        = uniqueN(Age),         # should be 1
+  n_sexes       = uniqueN(Sex),         # should be 1
+  recorded_ages = paste(sort(unique(Age)), collapse = ";")
+), by = Individual]
+
+donors[, paired   := n_cell_types == 2]
+donors[, included := paired & n_ages == 1 & n_sexes == 1]
+
+donors[, .N, by = .(paired, included)]
+```
+
+The paired donors we exclude all have **conflicting ages** recorded on
+different arrays:
+
+```{r excluded-donors}
+donors[paired & !included]
+```
+
+Next we copy the `paired` and `included` flags onto every array. We also turn
+the grouping columns into factors, because the models treat them as
+categories.
+
+```{r flag-arrays}
+metadata$paired   <- donors$paired[match(metadata$Individual, donors$Individual)]
+metadata$included <- donors$included[match(metadata$Individual, donors$Individual)]
+
+for (name in c("Sex", "CellType", "Batch", "Individual")) {
+  metadata[[name]] <- factor(metadata[[name]])
+}
+rownames(metadata) <- metadata$sample_id
+
+fwrite(donors,   "results/tables/donor_qc.csv")
+fwrite(metadata, "results/tables/sample_metadata.csv")
+```
+
+## A look at the analysis cohort
+
+```{r cohort}
+cohort <- metadata[metadata$included, ]
+
+# Arrays per cell type and sex
+table(CellType = cohort$CellType, Sex = cohort$Sex)
+
+# How many arrays does each donor have? (2 = one per cell type)
+as.data.frame(table(arrays_per_donor = table(droplevels(cohort$Individual))))
+```
+
+Most donors have one array per cell type. A few have repeat arrays. Because
+the same person appears several times, arrays from one donor are not
+independent, and Step 2 models this with a donor term.
+
+```{r age-plot, fig.width = 6, fig.height = 3}
+donor_info <- unique(cohort[, c("Individual", "Age", "Sex")])
+
+ggplot(donor_info, aes(Age, fill = Sex)) +
+  geom_histogram(binwidth = 2, colour = "white") +
+  facet_wrap(~ Sex) +
+  labs(x = "Age (years)", y = "Donors",
+       title = "Age of the analysed donors") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+# Read the expression matrix
+
+`fread()` reads large tables quickly. It can only read a `.gz` file directly if
+an extra package is installed, so we decompress the file to a temporary copy
+first. We skip the header lines and read exactly the number of probe rows that
+GEO reports.
+
+```{r read-expression}
+connection <- gzfile("data/raw/GSE56035_series_matrix.txt.gz", "rb")
+temporary  <- tempfile(fileext = ".txt")
+output     <- file(temporary, "wb")
+repeat {
+  block <- readBin(connection, "raw", n = 1024 * 1024)  # 1 MB at a time
+  if (!length(block)) break
+  writeBin(block, output)
+}
+close(connection)
+close(output)
+
+table <- fread(temporary,
+               skip  = length(header) + 1,
+               nrows = as.integer(read_field("!Sample_data_row_count")[1]))
+unlink(temporary)
+
+# Turn the table into a numeric matrix: rows = probes, columns = arrays.
+probe_ids  <- as.character(table[[1]])
+expression <- as.matrix(table[, -1])
+storage.mode(expression) <- "double"
+rownames(expression) <- probe_ids
+
+# The columns must be in the same order as the rows of `metadata`.
+stopifnot(identical(colnames(expression), metadata$sample_id),
+          !anyDuplicated(probe_ids),
+          all(is.finite(expression)))
+
+dim(expression)       # probes x arrays
+expression[1:5, 1:4]  # top-left corner
+```
+
+# Check for batch effects
+
+Arrays were processed in batches, and batch-to-batch technical differences are
+a common problem in expression data. Before changing anything, we ask how much
+of each probe's variation the recorded batch labels can explain.
+
+For each probe and each cell type, we regress expression on batch and record
+the **R²**, the fraction of variance explained. A batch factor with many levels
+always explains *some* variance by chance. To show what chance alone looks like,
+we repeat the calculation with **shuffled** batch labels. If the real R² is
+close to the shuffled R², the recorded batches carry little real signal.
+
+```{r batch-check}
+# R-squared of `values` (probes x arrays) on `batch`, for every probe at once.
+batch_r2 <- function(values, batch) {
+  y     <- t(values)                                 # arrays x probes
+  fit   <- lm.fit(model.matrix(~ batch), y)          # one regression per probe
+  total <- colSums(sweep(y, 2, colMeans(y))^2)       # total sum of squares
+  1 - colSums(fit$residuals^2) / total
+}
+
+set.seed(20261104)  # makes the shuffled labels reproducible
+batch_checks <- list()
+for (cell in unique(as.character(metadata$CellType))) {
+  samples <- metadata$CellType == cell
+  batch   <- droplevels(metadata$Batch[samples])
+  batch_checks[[cell]] <- data.frame(
+    probe_id    = probe_ids,
+    cell_type   = cell,
+    observed_r2 = batch_r2(expression[, samples], batch),
+    shuffled_r2 = batch_r2(expression[, samples], sample(batch))
+  )
+}
+batch_structure <- do.call(rbind, batch_checks)
+fwrite(batch_structure, "results/tables/batch_structure.csv")
+```
+
+```{r batch-summary}
+batch_summary <- as.data.table(batch_structure)[, .(
+  median_r2_real_labels     = median(observed_r2),
+  median_r2_shuffled_labels = median(shuffled_r2),
+  percent_probes_real_below_shuffled = 100 * mean(observed_r2 < shuffled_r2)
+), by = cell_type]
+batch_summary
+```
+
+```{r batch-plot, fig.width = 7, fig.height = 3}
+batch_long <- melt(as.data.table(batch_structure),
+                   id.vars = c("probe_id", "cell_type"),
+                   variable.name = "labels", value.name = "r2")
+
+ggplot(batch_long, aes(r2, colour = labels)) +
+  geom_density() +
+  facet_wrap(~ cell_type) +
+  scale_x_log10() +
+  scale_colour_manual(values = c(observed_r2 = "#1F78B4", shuffled_r2 = "grey50"),
+                      labels = c("Real batch labels", "Shuffled labels")) +
+  labs(x = "R² explained by batch, per probe (log scale)", y = "Density",
+       colour = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+**How to read this.** If batches had introduced technical differences, the
+blue curve (real labels) would sit to the **right** of the grey one, because
+real batches would explain more than random groupings. Here it sits far to the
+**left**. The real batch labels explain *less* variance than shuffled labels for
+`r round(min(batch_summary$percent_probes_real_below_shuffled), 1)`% or more of
+probes. This is the pattern you would expect if batch had already been removed
+before the data were deposited in GEO, although the full processing history is
+unknown. We apply **no** further batch correction. Step 2 still includes batch
+in the model, so any batch variation that remains is measured.
+
+# Convert to log2 scale and remove problem probes
+
+GEO describes these values as RMA output "on 2^ scale". RMA normally produces
+log2 values, so here they have been converted back to the linear scale. We take
+`log2()` to return to the usual log scale.
+
+A logarithm is only defined for positive numbers, yet some probes contain zero
+or negative values. Rather than clip those values or add an arbitrary
+pseudocount, we **remove any probe that has a nonpositive value on any array**.
+
+```{r log-transform}
+# Confirm GEO describes every array as "Output on 2^ scale".
+stopifnot(all(grepl("Output on 2\\^ scale", read_field("!Sample_data_processing"))))
+
+probe_qc <- data.frame(probe_id      = probe_ids,
+                       n_nonpositive = rowSums(expression <= 0))
+keep_probe <- probe_qc$n_nonpositive == 0
+probe_qc$included <- keep_probe
+
+expression <- log2(expression[keep_probe, ])
+
+# Every remaining probe must actually vary across the analysed arrays.
+stopifnot(all(apply(expression[, metadata$included], 1, var) > 1e-8))
+fwrite(probe_qc, "results/tables/probe_qc.csv")
+
+c(probes_removed = sum(!keep_probe), probes_kept = sum(keep_probe))
+```
+
+# Add gene annotation
+
+Probe IDs are numbers, such as `8157524`. The platform annotation file tells us
+which gene each probe measures. We keep the **probe** as the unit of analysis
+and do not average probes into genes, because some probes map to several genes
+(shown as `A /// B`) or to none. The annotation is only there to help us
+interpret the results.
+
+```{r annotation}
+connection <- gzfile("data/raw/GPL6244.annot.gz", "rt")
+lines <- readLines(connection)
+close(connection)
+
+# The probe table sits between these two marker lines.
+start <- which(lines == "!platform_table_begin") + 1
+end   <- which(lines == "!platform_table_end") - 1
+platform <- fread(text = paste(lines[start:end], collapse = "\n"),
+                  sep = "\t", quote = "", fill = TRUE)
+platform <- platform[match(probe_ids, as.character(platform$ID)), ]
+
+annotation <- data.frame(
+  probe_id   = probe_ids,
+  symbol     = platform[["Gene symbol"]],
+  gene_title = platform[["Gene title"]],
+  gene_id    = platform[["Gene ID"]]
+)
+annotation$symbol[is.na(annotation$symbol) | annotation$symbol == ""] <- NA_character_
+annotation$unique_symbol <- !is.na(annotation$symbol) &
+  !grepl("///", annotation$symbol, fixed = TRUE)
+fwrite(annotation, "results/tables/probe_annotation.csv")
+
+# The three probes used as examples later in the analysis:
+subset(annotation, probe_id %in% c("8157524", "8177232", "7903765"),
+       select = c(probe_id, symbol, gene_title))
+```
+
+# Save the prepared data
+
+Everything the next steps need is saved in one R object:
+
+* `expression`: log2 expression matrix (probes × **all** arrays)
+* `metadata`: one row per array, including the `included` flag
+* `annotation`: probe-to-gene table
+
+All arrays are kept in the saved file, and the `included` flag marks the
+analysis cohort. This lets the sensitivity analysis in Step 4 use a slightly
+larger set of donors.
+
+```{r save}
+saveRDS(list(expression = expression, metadata = metadata, annotation = annotation),
+        "data/processed/immvar.rds", compress = FALSE)
+
+counts <- data.frame(
+  item = c("Input arrays", "Input probes", "Donor prefixes", "Paired donors",
+           "Primary donors", "Primary arrays", "Retained probes"),
+  n    = c(nrow(metadata), length(probe_ids), nrow(donors), sum(donors$paired),
+           sum(donors$included), sum(metadata$included), nrow(expression))
+)
+fwrite(counts, "results/tables/sample_counts.csv")
+counts
+```
+
+# Summary
+
+* Starting from **`r format(nrow(metadata), big.mark = ",")` arrays** and
+  **`r format(length(probe_ids), big.mark = ",")` probes**, the analysis keeps
+  **`r sum(donors$included)` donors** with both cell types and consistent
+  records, which gives **`r sum(metadata$included)` arrays**.
+* **`r format(nrow(expression), big.mark = ",")` probes** remain after
+  removing those with nonpositive values. Expression is now on the log2 scale.
+* The recorded batch labels explain even less variance than shuffled labels,
+  which suggests batch was already adjusted for before the data reached GEO.
+
+**Next:** open `02_fit_models.Rmd` to fit the variance partitioning models.
+
+<details><summary>R session information</summary>
+
+```{r session-info}
+sessionInfo()
+```
+
+</details>

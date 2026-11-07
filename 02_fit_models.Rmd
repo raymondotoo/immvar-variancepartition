@@ -1,0 +1,333 @@
+---
+title: "Step 2 · Fit the variance partitioning models"
+subtitle: "ImmVar variancePartition analysis"
+author: "Raymond Otoo"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    df_print: kable
+    theme: flatly
+params:
+  refit: false  # true = refit every model, even if saved results already exist
+  workers: 1    # CPU cores used for fitting; more cores = faster, same results
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, fig.align = "center")
+```
+
+> **In this step** we fit one linear mixed model per probe and split each
+> probe's expression variance into parts explained by cell type, donor, age,
+> sex, batch and noise. We fit three models: one using both cell types
+> together, and one within each cell type.
+>
+> **Reads:** `data/processed/immvar.rds` (from Step 1)<br>
+> **Writes:** `results/models/{combined,CD4_T,Monocyte}.rds` and matching CSV
+> tables in `results/tables/`<br>
+> **Run time:** a few seconds when saved fits exist. Fitting from scratch takes
+> about 30 minutes on one CPU core, or about 5 minutes on eight; see
+> [Fit every probe](#fit-every-probe).
+
+# What variancePartition does
+
+Expression of a gene varies from one array to the next. Some of that variation
+is explained by things we recorded, such as which cell type was measured or
+which donor it came from, and the rest is noise. **variancePartition** fits a
+**linear mixed model** to each probe and divides the total variance into one
+piece per variable:
+
+```
+total variance = cell type + donor + sex + batch + age + residual
+```
+
+Each piece is then divided by the total to give a **variance fraction**. The
+fractions for a probe are between 0 and 1 and **always add up to 1 (100%)**.
+For example, if cell type has a fraction of 0.80 for a probe, then 80% of that
+probe's variation across arrays is associated with cell type.
+
+## The terms in our model
+
+| Term | How it enters the model | What it captures |
+|---|---|---|
+| `CellType` | random effect `(1 | CellType)` | Differences between naïve CD4 T cells and monocytes |
+| `Individual` | random effect `(1 | Individual)` | Differences between **donors** that persist across their arrays |
+| `Sex` | random effect `(1 | Sex)` | Differences between female and male donors |
+| `Batch` | random effect `(1 | Batch)` | Technical differences between processing batches |
+| `Age` | fixed effect `Age` | A straight-line trend with age |
+| `Residuals` | — | Everything else: measurement noise and unrecorded factors |
+
+**Why are categorical variables random effects?** The variancePartition authors
+recommend modelling categorical variables as random effects, written
+`(1 | variable)`, and continuous variables such as age as fixed effects. For
+variables with only a few categories, such as sex or cell type, the choice
+makes little difference. For variables with many categories, such as the
+hundreds of donors here, a random effect is needed to obtain correct variance
+estimates. Step 4 checks this by refitting with sex and cell type as fixed
+effects.
+
+**What does the donor term mean?** In the combined model, the donor effect is
+shared by a person's T-cell and monocyte arrays, so it captures person-level
+differences that appear in **both** cell types. Genetics is one such
+difference, but the donor fraction is **not** a heritability estimate.
+
+# Setup
+
+```{r packages}
+.libPaths(c("library", .libPaths()))
+library(variancePartition)  # fitExtractVarPartModel(), calcVarPart()
+library(BiocParallel)       # SerialParam() / MulticoreParam(): run fits in parallel
+library(data.table)
+library(ggplot2)
+```
+
+# Load the prepared data
+
+We keep only the analysis cohort (the `included` arrays from Step 1). Age is
+**standardised** to mean 0 and standard deviation 1. This helps the model
+fitting numerically and does not change Age's variance fraction.
+
+```{r load-data}
+data <- readRDS("data/processed/immvar.rds")
+
+expression <- data$expression[, data$metadata$included]
+metadata   <- droplevels(data$metadata[data$metadata$included, ])
+metadata$Age <- as.numeric(scale(metadata$Age))
+
+# Arrays (columns) and metadata rows must be in the same order.
+stopifnot(identical(colnames(expression), rownames(metadata)))
+dir.create("results/models", recursive = TRUE, showWarnings = FALSE)
+
+c(probes  = nrow(expression),
+  arrays  = ncol(expression),
+  donors  = nlevels(metadata$Individual),
+  batches = nlevels(metadata$Batch))
+```
+
+# The model formulas
+
+The formulas have no left-hand side because variancePartition applies them to
+**every row** of the expression matrix in turn.
+
+```{r formulas}
+# Both cell types together
+combined_formula <- ~ Age + (1 | Sex) + (1 | CellType) + (1 | Batch) + (1 | Individual)
+
+# One cell type at a time, so there is no cell type term
+within_formula <- ~ Age + (1 | Sex) + (1 | Batch) + (1 | Individual)
+```
+
+**A caution about the within-cell models.** Inside a single cell type, most
+donors have just one array. Only donors with **repeat arrays** let the model
+tell "this person differs from others" apart from random noise. The donor
+fractions from the within-cell models therefore rest on a small number of
+repeats and should be interpreted cautiously.
+
+# Walkthrough: one probe, by hand {#walkthrough}
+
+Before fitting more than 21,000 probes, let us open the black box for a single
+probe. We use **TLR4** (probe `8157524`), a receptor that monocytes express and
+naïve T cells do not.
+
+```{r one-probe-plot, fig.width = 5, fig.height = 3}
+probe <- "8157524"  # TLR4
+
+one_probe <- metadata
+one_probe$expression <- expression[probe, ]
+
+ggplot(one_probe, aes(CellType, expression)) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  labs(x = NULL, y = "log2 expression", title = "TLR4 expression by cell type") +
+  theme_minimal()
+```
+
+The two cell types barely overlap, so we expect cell type to explain most of
+this probe's variance. We fit the same mixed model directly with `lme4`, the
+package variancePartition uses internally:
+
+```{r one-probe-fit}
+fit <- lme4::lmer(
+  expression ~ Age + (1 | Sex) + (1 | CellType) + (1 | Batch) + (1 | Individual),
+  data = one_probe,
+  REML = FALSE
+)
+```
+
+Next we collect the variance pieces:
+
+1. **Random effects and residual.** `VarCorr()` reports these directly, in the
+   `vcov` column.
+2. **Age.** This is a fixed effect, so its piece is the variance of
+   Age's contribution (Age × its slope) across the arrays.
+
+```{r one-probe-pieces}
+random_parts <- as.data.frame(lme4::VarCorr(fit))
+random_parts[, c("grp", "vcov")]
+
+age_contribution <- one_probe$Age * lme4::fixef(fit)[["Age"]]
+age_part <- mean((age_contribution - mean(age_contribution))^2)
+
+pieces <- c(setNames(random_parts$vcov, random_parts$grp), Age = age_part)
+names(pieces)[names(pieces) == "Residual"] <- "Residuals"
+```
+
+Divide each piece by the total and compare the result with variancePartition.
+`calcVarPart()` computes fractions from a fitted model, and
+`fitExtractVarPartModel()` fits **and** computes in one call. This is the
+function we use for all probes below.
+
+```{r one-probe-compare}
+by_hand <- pieces / sum(pieces)
+
+from_calcVarPart <- calcVarPart(fit)
+
+# fitExtractVarPartModel() expects several probes (it fails on a single row),
+# so we give it our three example probes and keep the TLR4 row.
+example_probes <- c("8157524", "8177232", "7903765")  # TLR4, KDM5D, GSTM1
+from_fitExtract <- fitExtractVarPartModel(
+  expression[example_probes, ], combined_formula, metadata,
+  REML = FALSE, useInitialFit = FALSE, BPPARAM = SerialParam()
+)
+
+components <- names(from_calcVarPart)
+data.frame(
+  component              = components,
+  by_hand                = signif(by_hand[components], 4),
+  calcVarPart            = signif(from_calcVarPart[components], 4),
+  fitExtractVarPartModel = signif(unlist(from_fitExtract[probe, components]), 4),
+  row.names = NULL
+)
+```
+
+All three columns agree, and each adds up to 1. For TLR4, cell type explains
+about **`r round(100 * by_hand[["CellType"]])`%** of the variance. That is all
+variancePartition does for each probe: fit a mixed model, then express each
+variance component as a share of the total.
+
+> **Note:** for some probes, lme4 reports a *"boundary (singular) fit"*. That
+> means one variance was estimated as exactly zero (often batch, here). It is
+> expected and is not an error.
+
+# Fit every probe {#fit-every-probe}
+
+`fitExtractVarPartModel()` repeats the walkthrough for every row of the
+expression matrix. We use two settings deliberately:
+
+* `REML = FALSE` fits by maximum likelihood, the variancePartition default. We
+  set it explicitly so the choice is visible.
+* `useInitialFit = FALSE` fits each probe from scratch. By default the package
+  fits the first probe and uses its solution as the starting point for all the
+  others. That is faster, but a starting point at a boundary, such as a
+  variance of exactly zero, can then carry over to probes where it does not
+  belong.
+
+The helper below fits one model, checks the output and saves it:
+
+```{r fit-function}
+fit_and_save <- function(expression, metadata, formula, name, backend) {
+  stopifnot(identical(colnames(expression), rownames(metadata)))
+  message("Fitting ", name, ": ", nrow(expression), " probes, ",
+          ncol(expression), " arrays")
+
+  result <- fitExtractVarPartModel(expression, formula, metadata,
+                                   REML = FALSE, useInitialFit = FALSE,
+                                   BPPARAM = backend)
+  result <- as.data.frame(result)
+
+  # Every probe must be present, and its fractions must be valid and sum to 1.
+  stopifnot(identical(rownames(result), rownames(expression)),
+            all(is.finite(as.matrix(result))),
+            all(as.matrix(result) >= 0),
+            max(abs(rowSums(result) - 1)) < 1e-6)
+
+  saveRDS(result, paste0("results/models/", name, ".rds"))
+  fwrite(data.frame(probe_id = rownames(result), result),
+         paste0("results/tables/", name, ".csv"))
+  message("Finished ", name)
+}
+```
+
+**Saving time.** Fitting three models to more than 21,000 probes each is the
+slow part of this project. The next chunk therefore **reuses saved results**
+whenever `results/models/<name>.rds` already exists. To force a fresh fit, knit
+with the parameter `refit: true`. In RStudio, use *Knit ▸ Knit with
+Parameters…*. To use several CPU cores, set `workers` to more than 1. The
+results are the same; only the speed changes.
+
+```{r fit-or-load-function}
+backend <- if (params$workers > 1) {
+  MulticoreParam(workers = params$workers)  # on Windows, use SnowParam() instead
+} else {
+  SerialParam()
+}
+
+fit_or_load <- function(expression, metadata, formula, name) {
+  saved_file <- paste0("results/models/", name, ".rds")
+  if (params$refit || !file.exists(saved_file)) {
+    started <- Sys.time()
+    fit_and_save(expression, metadata, formula, name, backend)
+    action <- sprintf("fitted now (%.1f minutes)",
+                      as.numeric(difftime(Sys.time(), started, units = "mins")))
+  } else {
+    action <- "loaded saved results"
+  }
+  data.frame(model = name, arrays = ncol(expression), status = action)
+}
+```
+
+```{r fit-models, message = TRUE}
+is_t_cell   <- metadata$CellType == "CD4_T"
+is_monocyte <- metadata$CellType == "Monocyte"
+
+rbind(
+  fit_or_load(expression, metadata, combined_formula, "combined"),
+  fit_or_load(expression[, is_t_cell],   droplevels(metadata[is_t_cell, ]),
+              within_formula, "CD4_T"),
+  fit_or_load(expression[, is_monocyte], droplevels(metadata[is_monocyte, ]),
+              within_formula, "Monocyte")
+)
+
+capture.output(sessionInfo(), file = "results/sessionInfo.txt")
+```
+
+# A first look at the results
+
+Each result is a table with **one row per probe** and **one column per variance
+component**:
+
+```{r first-look}
+combined <- readRDS("results/models/combined.rds")
+
+dim(combined)
+head(round(combined, 3))
+
+range(rowSums(combined))  # every row adds up to 1
+```
+
+The TLR4 row from the full fit matches the walkthrough above:
+
+```{r tlr4-row}
+round(combined[probe, ], 4)
+```
+
+# Summary
+
+* We fitted **three models** to
+  **`r format(nrow(expression), big.mark = ",")` probes**: the combined model
+  (`r ncol(expression)` arrays) and one within each cell type.
+* Each probe now has six variance fractions that add up to 1.
+* The walkthrough showed exactly how a fraction is calculated, and that our
+  by-hand numbers match variancePartition.
+
+**Next:** open `03_make_figures.Rmd` to summarise and plot the results.
+
+<details><summary>R session information</summary>
+
+```{r session-info}
+sessionInfo()
+```
+
+</details>

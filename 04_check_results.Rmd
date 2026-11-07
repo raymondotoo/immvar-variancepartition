@@ -1,0 +1,410 @@
+---
+title: "Step 4 · Check the results"
+subtitle: "ImmVar variancePartition analysis"
+author: "Raymond Otoo"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    df_print: kable
+    theme: flatly
+params:
+  refit: false  # true = rerun the sensitivity models, even if saved results exist
+  workers: 1    # CPU cores used for the sensitivity models
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, fig.align = "center")
+```
+
+> **In this step** we test whether the results from Step 2 can be trusted. We
+> run four checks:
+>
+> 1. **Completeness:** was every probe fitted, and are all fractions valid?
+> 2. **Independent refit:** does a different optimiser give the same answer?
+> 3. **Residual diagnostics:** do the model's assumptions look reasonable?
+> 4. **Sensitivity analyses:** do the conclusions change if we make different,
+>    defensible modelling choices?
+>
+> **Reads:** `data/processed/immvar.rds` (Step 1) and `results/models/*.rds` (Step 2)<br>
+> **Writes:** check tables in `results/tables/`, diagnostic figures in
+> `results/figures/`, and `results/checks.txt`<br>
+> **Run time:** about 2 minutes the first time; seconds when saved
+> sensitivity fits exist
+
+# Setup and data
+
+```{r packages}
+.libPaths(c("library", .libPaths()))
+library(variancePartition)
+library(BiocParallel)
+library(data.table)
+library(ggplot2)
+```
+
+We load the same analysis cohort and formulas used in Step 2.
+
+```{r load}
+data <- readRDS("data/processed/immvar.rds")
+expression <- data$expression[, data$metadata$included]
+metadata   <- droplevels(data$metadata[data$metadata$included, ])
+metadata$Age <- as.numeric(scale(metadata$Age))
+
+models <- list(
+  Combined = readRDS("results/models/combined.rds"),
+  CD4_T    = readRDS("results/models/CD4_T.rds"),
+  Monocyte = readRDS("results/models/Monocyte.rds")
+)
+
+# The same formulas as Step 2
+combined_formula <- ~ Age + (1 | Sex) + (1 | CellType) + (1 | Batch) + (1 | Individual)
+within_formula   <- ~ Age + (1 | Sex) + (1 | Batch) + (1 | Individual)
+```
+
+# Check 1: every probe fitted, every fraction valid
+
+A model can fail to converge for some probes, and variancePartition would then
+silently drop them. Here we confirm that each model returned **every** probe,
+and that every fraction is finite, nonnegative and adds up to 1.
+
+```{r check-completeness}
+fit_counts <- data.frame()
+for (name in names(models)) {
+  result <- models[[name]]
+  stopifnot(identical(rownames(result), rownames(expression)),
+            all(is.finite(as.matrix(result))),
+            all(as.matrix(result) >= 0),
+            max(abs(rowSums(result) - 1)) < 1e-6)
+  fit_counts <- rbind(fit_counts, data.frame(
+    model     = name,
+    attempted = nrow(expression),
+    fitted    = nrow(result),
+    failed    = nrow(expression) - nrow(result)
+  ))
+}
+fwrite(fit_counts, "results/tables/model_fit_counts.csv")
+fit_counts
+```
+
+# Check 2: an independent refit
+
+Fitting a mixed model means numerically searching for the variance values that
+best explain the data. The algorithm that does the search is called an
+**optimiser**. If a different optimiser lands on the same answer, we can be
+confident the original result is not an artefact of the search getting stuck.
+
+We refit **53 probes** in each model: our three examples plus 50 chosen at
+random. We call `lme4::lmer()` directly with the `bobyqa` optimiser and then
+compare the fractions.
+
+```{r independent-refit}
+set.seed(20261104)
+example_ids <- c("8177232", "8157524", "7903765")  # KDM5D, TLR4, GSTM1
+audit_ids   <- unique(c(example_ids, sample(rownames(expression), 50)))
+
+control <- lme4::lmerControl(optimizer = "bobyqa", calc.derivs = FALSE,
+                             optCtrl = list(maxfun = 100000))
+
+audit         <- list()
+residual_data <- list()  # kept for Check 3
+
+for (name in names(models)) {
+  samples     <- if (name == "Combined") rep(TRUE, nrow(metadata)) else metadata$CellType == name
+  sample_data <- droplevels(metadata[samples, ])
+  formula     <- if (name == "Combined") combined_formula else within_formula
+
+  for (id in audit_ids) {
+    sample_data$expression <- as.numeric(expression[id, samples])
+
+    # A variance estimated at zero gives a harmless "singular fit" message.
+    fit <- suppressMessages(lme4::lmer(update(formula, expression ~ .), sample_data,
+                                       REML = FALSE, control = control))
+
+    independent <- calcVarPart(fit)
+    original    <- as.numeric(models[[name]][id, names(independent)])
+
+    audit[[paste(name, id)]] <- data.frame(
+      model                = name,
+      probe_id             = id,
+      component            = names(independent),
+      pipeline_fraction    = original,
+      independent_fraction = unname(independent),
+      absolute_difference  = abs(original - unname(independent))
+    )
+
+    if (name == "Combined" && id %in% example_ids) {
+      residual_data[[id]] <- data.frame(
+        probe_id              = id,
+        fitted                = fitted(fit),
+        standardized_residual = residuals(fit) / sigma(fit)
+      )
+    }
+  }
+}
+
+audit <- rbindlist(audit)
+fwrite(audit, "results/tables/independent_fit_check.csv")
+stopifnot(max(audit$absolute_difference) < 0.01)  # stop if any fraction differs by > 1 point
+
+audit[, .(probes = uniqueN(probe_id),
+          largest_difference_in_percentage_points = 100 * max(absolute_difference)),
+      by = model]
+```
+
+**Result:** the two optimisers agree to within
+**`r signif(100 * max(audit$absolute_difference), 2)` percentage points** for
+every component of every probe checked.
+
+# Check 3: residual diagnostics
+
+A linear mixed model assumes that, once all the terms are accounted for, the
+leftover variation (the **residuals**) is roughly normal and has a similar
+spread everywhere. We check this for the three example probes with two
+standard plots:
+
+* **Residuals vs fitted (top):** we want a shapeless cloud centred on zero.
+  Separate clusters are fine. They simply reflect groups with different
+  average expression, such as the two cell types.
+* **Normal Q–Q (bottom):** if the residuals are normal, the points follow the
+  straight line. Departures in the tails indicate outlying arrays.
+
+```{r residual-plots, fig.width = 9, fig.height = 6}
+residual_data <- rbindlist(residual_data)
+residual_data$gene <- c("8177232" = "KDM5D", "8157524" = "TLR4",
+                        "7903765" = "GSTM1")[residual_data$probe_id]
+
+residual_plot <- ggplot(residual_data, aes(fitted, standardized_residual)) +
+  geom_point(alpha = 0.3, size = 0.7) +
+  geom_hline(yintercept = 0) +
+  facet_wrap(~ gene, scales = "free_x") +
+  theme_minimal() +
+  labs(x = "Fitted expression", y = "Standardized residual")
+
+qq_plot <- ggplot(residual_data, aes(sample = standardized_residual)) +
+  stat_qq(alpha = 0.4, size = 0.7) +
+  stat_qq_line() +
+  facet_wrap(~ gene) +
+  theme_minimal() +
+  labs(x = "Theoretical normal quantile", y = "Observed residual quantile")
+
+diagnostics <- cowplot::plot_grid(residual_plot, qq_plot, ncol = 1)
+ggsave("results/figures/model_diagnostics.png", diagnostics,
+       width = 11, height = 7, dpi = 200, bg = "white")
+ggsave("results/figures/model_diagnostics.pdf", diagnostics,
+       width = 11, height = 7, bg = "white")
+diagnostics
+```
+
+**What we see.** The residuals are centred on zero, and the clusters reflect
+cell type (TLR4) or cell type and sex (KDM5D). In the Q–Q plots, all three
+probes follow the line through the middle but have **heavier tails** than a
+normal distribution, meaning a few arrays sit further from their fitted value
+than expected. This is common in expression data.
+
+Variance fractions are **descriptive** summaries, not hypothesis tests, so
+modest departures from normality do not invalidate them. These plots are there
+to catch gross problems, such as a handful of extreme arrays driving a result.
+
+# Check 4: sensitivity analyses
+
+Every analysis involves judgement calls. A sensitivity analysis repeats the
+analysis with a different, equally defensible choice and asks whether the
+conclusions change. We test two choices:
+
+| Analysis | What changes | Why |
+|---|---|---|
+| **All paired donors, no age** | Adds back the 9 donors with conflicting ages and drops `Age` from the model | Checks that excluding those donors did not shape the results |
+| **Sex and cell type as fixed effects** | Codes sex and cell type as 0/1 fixed effects instead of random effects | Checks that the random-effect choice for two-level variables does not matter |
+
+To save time, we run both on the same **2,000 randomly chosen probes**. A
+random sample avoids favouring, say, only highly variable genes. We then
+compare the results with the main model on those same probes.
+
+```{r sensitivity-setup}
+set.seed(20261104)
+subset_ids <- sample(rownames(expression), 2000)
+fwrite(data.frame(probe_id = subset_ids), "results/tables/sensitivity_probes.csv")
+
+backend <- if (params$workers > 1) MulticoreParam(workers = params$workers) else SerialParam()
+
+fit_sensitivity <- function(expression, metadata, formula) {
+  result <- as.data.frame(fitExtractVarPartModel(expression, formula, metadata,
+    REML = FALSE, useInitialFit = FALSE, BPPARAM = backend))
+  stopifnot(identical(rownames(result), rownames(expression)),
+            all(is.finite(as.matrix(result))),
+            max(abs(rowSums(result) - 1)) < 1e-6)
+  result
+}
+
+# Reuse a saved sensitivity fit when it exists (set `refit: true` to redo it).
+fit_or_load_sensitivity <- function(name, expression, metadata, formula) {
+  saved_file <- paste0("results/models/sensitivity_", name, ".rds")
+  if (params$refit || !file.exists(saved_file)) {
+    saveRDS(fit_sensitivity(expression, metadata, formula), saved_file)
+  }
+  result <- readRDS(saved_file)
+  stopifnot(identical(rownames(result), rownames(expression)))  # same probes?
+  result
+}
+```
+
+```{r sensitivity-fits}
+# (a) All 388 paired donors, without age.
+paired <- droplevels(data$metadata[data$metadata$paired, ])
+no_age_formula <- ~ (1 | Sex) + (1 | CellType) + (1 | Batch) + (1 | Individual)
+all_paired <- fit_or_load_sensitivity(
+  "All_paired_no_age",
+  data$expression[subset_ids, paired$sample_id], paired, no_age_formula
+)
+
+# (b) Sex and cell type as numeric 0/1 fixed effects.
+fixed_metadata <- metadata
+fixed_metadata$Sex      <- as.numeric(fixed_metadata$Sex == "Male")
+fixed_metadata$CellType <- as.numeric(fixed_metadata$CellType == "Monocyte")
+fixed_formula <- ~ Age + Sex + CellType + (1 | Batch) + (1 | Individual)
+binary_fixed <- fit_or_load_sensitivity(
+  "Binary_fixed",
+  expression[subset_ids, ], fixed_metadata, fixed_formula
+)
+
+c(paired_donors = nlevels(paired$Individual), paired_arrays = nrow(paired))
+```
+
+## Compare with the main model
+
+We compare in two ways:
+
+* **Median fractions:** does the typical probe look the same?
+* **Spearman correlation**, per component, between each sensitivity fit and the
+  main model. A value near 1 means probes keep the **same ranking**. The probes
+  with high donor variance in the main model also have high donor variance in
+  the alternative model.
+
+```{r sensitivity-compare}
+sensitivities <- list(
+  Primary_subset    = models$Combined[subset_ids, ],
+  All_paired_no_age = all_paired,
+  Binary_fixed      = binary_fixed
+)
+
+summaries    <- list()
+correlations <- list()
+for (name in names(sensitivities)) {
+  result <- sensitivities[[name]]
+  fwrite(data.frame(probe_id = rownames(result), result),
+         paste0("results/tables/", name, ".csv"))
+
+  summaries[[name]] <- data.frame(
+    model          = name,
+    component      = names(result),
+    median_percent = 100 * vapply(result, median, numeric(1)),
+    row.names      = NULL
+  )
+
+  if (name == "Primary_subset") next  # the reference; nothing to compare with
+  components <- intersect(names(result), names(sensitivities$Primary_subset))
+  correlations[[name]] <- data.frame(
+    model     = name,
+    component = components,
+    spearman  = vapply(components, function(component) {
+      cor(result[[component]], sensitivities$Primary_subset[[component]],
+          method = "spearman")
+    }, numeric(1))
+  )
+}
+summaries    <- rbindlist(summaries)
+correlations <- rbindlist(correlations)
+fwrite(summaries,    "results/tables/sensitivity_summary.csv")
+fwrite(correlations, "results/tables/sensitivity_correlations.csv")
+```
+
+Median % of variance explained (columns = analysis):
+
+```{r sensitivity-medians}
+knitr::kable(dcast(summaries, component ~ model, value.var = "median_percent"),
+             digits = 2)
+```
+
+Spearman correlation with the main model (columns = analysis):
+
+```{r sensitivity-correlations}
+knitr::kable(dcast(correlations, component ~ model, value.var = "spearman"),
+             digits = 3)
+```
+
+```{r sensitivity-plot, fig.width = 8, fig.height = 4}
+sensitivity_plot <- ggplot(summaries, aes(component, median_percent, fill = model)) +
+  geom_col(position = "dodge") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(x = NULL, y = "Median variance explained (%)", fill = NULL)
+
+ggsave("results/figures/sensitivity_checks.png", sensitivity_plot,
+       width = 10, height = 5, dpi = 200, bg = "white")
+ggsave("results/figures/sensitivity_checks.pdf", sensitivity_plot,
+       width = 10, height = 5, bg = "white")
+sensitivity_plot
+```
+
+```{r lowest-correlation, include = FALSE}
+# Lowest correlation for a component across both analyses, rounded down.
+lowest <- function(name) {
+  sprintf("%.3f", floor(1000 * min(correlations[component == name]$spearman)) / 1000)
+}
+```
+
+**How to read this.** The large components, cell type, donor and residual,
+have similar medians in all three analyses. Their probe-by-probe correlations
+with the main model are very high: at least `r lowest("CellType")` for cell
+type and `r lowest("Individual")` for donor. The main conclusions therefore do not depend on these two modelling
+choices. Correlations for tiny components such as batch and sex are less
+informative, because most of their values are at or near zero.
+
+# Record versions and a summary of the checks
+
+Finally, we record exactly which package versions produced these results, and
+write a short plain-text summary of the checks.
+
+```{r record}
+packages <- c("variancePartition", "lme4", "limma", "BiocParallel",
+              "data.table", "ggplot2", "cowplot")
+package_versions <- data.frame(
+  package = packages,
+  version = vapply(packages, function(p) as.character(packageVersion(p)), character(1))
+)
+fwrite(package_versions, "results/package_versions.csv")
+capture.output(sessionInfo(), file = "results/sessionInfo.txt")
+
+writeLines(c(
+  "All three main models retained every probe; fractions are finite, nonnegative and sum to one.",
+  sprintf("Independent optimizer comparison: %d probes per model; maximum difference %.6f percentage points.",
+          length(audit_ids), 100 * max(audit$absolute_difference)),
+  "Sensitivity analyses: 2,000 fixed random probes; expanded paired cohort without age; numeric fixed sex/cell effects.",
+  "Residual diagnostics are saved separately; these variance fractions are descriptive point estimates."
+), "results/checks.txt")
+
+package_versions
+```
+
+# Summary
+
+| Check | Result |
+|---|---|
+| Completeness | All `r format(nrow(expression), big.mark = ",")` probes fitted in all three models; every fraction is valid |
+| Independent refit | `bobyqa` agrees to within `r signif(100 * max(audit$absolute_difference), 2)` percentage points |
+| Residual diagnostics | Saved to `results/figures/model_diagnostics.png` for visual review |
+| Sensitivity | Medians and probe rankings are stable for the main components |
+
+This completes the analysis. The one-page summary is in
+`report/ImmVar_summary.pdf`.
+
+<details><summary>R session information</summary>
+
+```{r session-info}
+sessionInfo()
+```
+
+</details>
